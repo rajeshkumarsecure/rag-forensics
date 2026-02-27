@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-# Program is developed on Ubuntu 22.04.2 and Python 3.10.12
-# Program to perform RAG-driven forensic analysis on new memory dumps using Azure OpenAI and Qdrant vector DB.
-# Program extracts indicators of compromise (IoCs) from memory dumps, queries vector DB, and uses LLM for analysis.
-# Version: 1.0
-
 import json
 from openai import AzureOpenAI
 import os
@@ -16,9 +11,18 @@ from memory_extraction_functions import (
     extract_network_information_from_dump,
     extract_process_information_from_dump,
     extract_memory_maps_from_dump,
+    extract_socket_redirections_from_lsof_output,
     extract_string_match_from_dump,
     extract_network_addr_details_from_dump,
-    execute_system_command
+    execute_system_command,
+    obtain_os_info_from_dump,
+    obtain_process_with_suspicious_threads_from_dump,
+    validate_sockets_for_suspicious_process,
+    dump_suspicious_processes_with_sockets,
+    process_windows_network_info_from_dump,
+    check_suspicious_network_bytes_in_dump,
+    extract_windows_yara_match_from_process_dumps,
+    delete_all_files_in_dumps_directory
 )
 
 from rag_utils import (
@@ -28,7 +32,7 @@ from rag_utils import (
 
 from html_utils import generate_html_report_from_json
 
-debug = False
+debug = True
 
 class NormalizeAndExtractRagAndQueryLLM:
     def __init__(self, dump_file_path):
@@ -39,7 +43,7 @@ class NormalizeAndExtractRagAndQueryLLM:
         self.indicators = dict()
 
         endpoint = os.getenv("ENDPOINT_URL", self.config["endpoint_url"])
-        self.embedding_deployment = os.getenv("DEPLOYMENT_NAME", self.config["embedding_model"])  # Embedding model deployment name
+        self.embedding_model = os.getenv("DEPLOYMENT_NAME", self.config["embedding_model"])  # Azure embedding deployment name
         subscription_key = os.getenv("AZURE_OPENAI_API_KEY", self.config["open_ai_api_key"])
 
         # Initialize Azure OpenAI client
@@ -56,17 +60,54 @@ class NormalizeAndExtractRagAndQueryLLM:
         self.qdrant_client = QdrantClient(host=self.config["qdrant_host"], port=self.config["qdrant_port"])
 
         self.process_information = {}
+
+        self.os_info = obtain_os_info_from_dump(self.dump_file)
     
     def load_config(self):
         with open(self.config_path, "r") as f:
             return json.load(f)
 
-
     def extract_information_from_dump(self):
-        extract_network_information_from_dump(self.dump_file, self.analysis_ioc, self.indicators, debug, self.process_information, collect_process_info=True)
-        extract_process_information_from_dump(self.dump_file, self.analysis_ioc, self.indicators, debug, self.process_information, collect_process_info=True)
-        extract_memory_maps_from_dump(self.dump_file, self.analysis_ioc, self.indicators, debug, self.process_information, collect_process_info=True)
-        extract_network_addr_details_from_dump(self.dump_file, self.analysis_ioc, self.indicators, debug, self.process_information, collect_process_info=True)
+        
+
+        if self.os_info == "linux":
+            extract_network_information_from_dump(self.dump_file, self.analysis_ioc, self.indicators, debug, self.process_information, collect_process_info=True)
+            extract_process_information_from_dump(self.dump_file, self.analysis_ioc, self.indicators, debug, self.process_information, collect_process_info=True)
+            extract_memory_maps_from_dump(self.dump_file, self.analysis_ioc, self.indicators, debug, self.process_information, collect_process_info=True)
+            extract_network_addr_details_from_dump(self.dump_file, self.analysis_ioc, self.indicators, debug, self.process_information, collect_process_info=True)
+            extract_socket_redirections_from_lsof_output(self.dump_file, self.analysis_ioc, self.indicators, debug, self.process_information, collect_process_info=True)
+        elif self.os_info == "windows":
+            suspicious_network_info = []
+
+            susp_process = obtain_process_with_suspicious_threads_from_dump(self.dump_file, debug=False, top_n=5)
+            susp_process_with_sockets = validate_sockets_for_suspicious_process(
+                self.dump_file,
+                susp_process,
+                self.analysis_ioc,
+                self.indicators,
+                debug,
+                self.process_information,
+                collect_process_info=True,
+            )
+            dump_results = dump_suspicious_processes_with_sockets(
+                    self.dump_file,
+                    susp_process_with_sockets,
+                    dumps_dir="dumps",
+                    debug=debug,
+            )
+
+            process_windows_network_info_from_dump(self.dump_file, suspicious_network_info, debug)
+            network_byte_matches = check_suspicious_network_bytes_in_dump(
+                suspicious_network_info,
+                susp_process=susp_process_with_sockets,
+                dumps_dir="dumps",
+                analysis_ioc=self.analysis_ioc,
+                indicators=self.indicators,
+                debug=debug,
+                process_information=self.process_information,
+                collect_process_info=True,
+            )
+            
 
         if debug:
             print("Analysis IoC Extracted:")
@@ -136,7 +177,7 @@ class NormalizeAndExtractRagAndQueryLLM:
     def query_vector_db(self, vector_db_query):
         print("Querying Vector DB...")
         embedding_response = self.azure_client.embeddings.create(
-            model=self.embedding_deployment,
+            model=self.embedding_model,
             input=vector_db_query
         )
 
@@ -196,14 +237,26 @@ class NormalizeAndExtractRagAndQueryLLM:
                 strings_of_interest.extend(payload['strings_of_interest'])
 
         if strings_of_interest:
-            extract_string_match_from_dump(self.dump_file, self.analysis_ioc, self.indicators, strings_of_interest, debug, self.process_information, collect_process_info=True)
+            if self.os_info == "linux":
+                extract_string_match_from_dump(self.dump_file, self.analysis_ioc, self.indicators, strings_of_interest, debug, self.process_information, collect_process_info=True)
+            elif self.os_info == "windows":
+                extract_windows_yara_match_from_process_dumps(
+                    analysis_ioc=self.analysis_ioc,
+                    indicators=self.indicators,
+                    strings_of_interest=strings_of_interest,
+                    dumps_dir="dumps",
+                    debug=debug,
+                    process_information=self.process_information,
+                    collect_process_info=True,
+                )
+        yarastrings = self.process_information.get(pid, {}).get("YARAStrings", [])
 
-        if debug and self.process_information[pid]["YARAStrings"]:
+        if debug and yarastrings:
             print("Malicious Strings found in Memory for the pid: {0}".format(pid))
             print("Analysis IoC Extracted:")
             print(json.dumps(self.analysis_ioc, indent=4))
             print("Yara Strings found:")
-            print(json.dumps(self.process_information[pid]["YARAStrings"], indent=4))
+            print(json.dumps(yarastrings, indent=4))
             print("Indicators:")
             print(json.dumps(self.indicators, indent=4))
 
@@ -216,13 +269,15 @@ class NormalizeAndExtractRagAndQueryLLM:
 
         vector_db_query = vector_db_query.rstrip(",")
 
-        if debug:
-            print(f"\nProcessing PID: {pid} with Indicators: {query_text}")
-            print(f"Vector DB Query: {vector_db_query}")
+        # if debug:
+        #     print(f"\nProcessing PID: {pid} with Indicators: {query_text}")
+        #     print(f"Vector DB Query: {vector_db_query}")
 
         vector_db_search_results = self.query_vector_db(vector_db_query)
 
         self.perform_memory_scan_on_suspicious_processes(pid, vector_db_search_results)
+
+        delete_all_files_in_dumps_directory(dumps_dir="dumps", debug=debug)
 
         if len(query_text) == 1 and query_text[0].startswith("ESTABLISHED"):
             print(f"Skipping LLM query for PID {pid} due to only having ESTABLISHED network connection indicator.")
